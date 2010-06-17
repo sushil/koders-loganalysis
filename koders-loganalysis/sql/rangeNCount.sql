@@ -1,0 +1,1 @@
+select min(ID), max(ID), count(ID) from SearchLog
