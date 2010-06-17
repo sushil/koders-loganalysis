@@ -1,0 +1,906 @@
+import java.util.Date;
+import java.util.GregorianCalendar;
+import java.lang.Math;	
+
+// data folder
+def fData = "/Users/shoeseal/Scratch/LogAnalysis/koders-data/tc/"
+
+
+// files
+
+// needs to be sorted by user ids
+def fUserActivities = fData + "uact.tsv"
+
+def fTermTopicDist = fData + "ttd.tsv"
+def fTopicCode = fData + "tc.code"
+
+// uid n=#topics E t1 tp1 ... tn tpn
+def fUserTopicList = fData + "utl.tsv"
+
+
+// data structures
+def topicCode = []        // [code1 .. coden]
+def userTopicList = [:]   // [uid: [t1 .. tn]]  // mapped list has just the topics for the user
+def userTopicProb = [:]   // [uid: [t1_prob .. tn_prob]] // mapped list has all the topics for the user
+
+def sessions = []         // [ [session_id, search/d, query, matched_topic, uid, timestamp] .. ]
+def sessionStat = []      // [ [session_id : [uid, first_topic, last_topic, num_dwnlds, num_search, num_topics]] .. ]
+def topicSessionStat = [:] // [ session_interval: [#sessions_started_with #sessions_ended_with #dwnlds_ended_with] .. ]
+int[] topicSearchActCount = new int[Constants.NUM_OF_TOPICS]  // [ #search-act-for-topic-1 .. #search-act-topic-n ]
+
+def topicFollowedCount = [:] // [session_interval: [ 51*51]]
+
+// cache for sym KL Div
+def termProbDistForQTerms =  [:] //  [ <qterms> : <double array; [term_1_prob .. term_n_prob]>   ] 
+def eucDistQTermsVsTopics = [:] //  [ <qterms> : <double array; [topic_1_dist .. topic_n_dist]> ]
+
+// aggregate session stat
+
+
+// def termsList = []     // [term1 term2 ... ]ok
+
+def termsIdxMap = [:]	  // [ term:idx .. ]
+def topicTermDist = []    // [ [topic1-term1-prob t1t2p ... ] [ t2t1p ... ] .. ]
+def topicTermRanks = []   // [ [topic1-term1-rank t1t2R .. ] .. ]
+
+AggregateSessionStat aggStat = new AggregateSessionStat()
+
+// Gets the uid and the processed query terms list
+// 	and returns the idx that matches the most.
+// pQTerms has all whitespaces replaced with space when loadSessions calls it
+def getMostSimTopic = { uid, pQTerms ->
+
+	def q = pQTerms
+	def topicIdList = userTopicList[uid] 
+
+	double maxScore = 0.0
+	double minScore = -1.0
+	int idx = 0
+	
+    //	 create entry if cache if not there
+	if(eucDistQTermsVsTopics[pQTerms]==null) {
+		eucDistQTermsVsTopics[pQTerms] = new double[Constants.NUM_OF_TOPICS]
+		// bootstrap the cache entry
+		for(int i=0; i<Constants.NUM_OF_TOPICS; i++){
+			eucDistQTermsVsTopics[pQTerms][i] = -1
+			// println "eucDistQTermsVsTopics[i] : " + pQTerms + " " + i + " " + eucDistQTermsVsTopics[pQTerms][i]
+		}
+	}
+	
+	def findTermIndex = { term ->
+		// println "found term: " + term
+		def foundIdx = -1 
+		
+	    def _result = termsIdxMap[term]
+		if (_result != null)
+			foundIdx = _result
+		// println "at: " + foundIdx
+		return foundIdx
+	}
+	
+	def getEuclideanDistance = { double[] pdist, double[] qdist ->
+		
+		// debug print "distance: " + MyUtil.euclidean(pdist, qdist)
+		return MyUtil.euclidean(pdist, qdist)
+		
+	}
+	
+	
+	def getTermProbDistForQueryTerms = { queryTerms ->
+		
+		// look in cache
+		double[] qtermsProbDist = termProbDistForQTerms[queryTerms]
+		
+		// not found in cache
+		if (qtermsProbDist == null){
+			//debug print queryTerms + "prob dist not found for: " + queryTerms  
+			
+			//{{{ start: compute
+			
+			qtermsProbDist = new double[termsIdxMap.size()]
+			queryTerms.split(" ").each() { t->
+				if(t.length()>0){
+					int tIdx = findTermIndex(t)
+					qtermsProbDist[tIdx] = qtermsProbDist[tIdx] + 1 
+				}
+			}
+			
+			// normalize freq to prob
+			double sum = 0
+			for(int i=0; i < qtermsProbDist.length; i++) {
+				sum = sum + qtermsProbDist[i]
+			}
+			
+			for(int i=0; i < qtermsProbDist.length; i++){
+				qtermsProbDist[i] = qtermsProbDist[i]/sum 
+			}
+			
+			//}}} end: compute
+			
+			// update cache
+			termProbDistForQTerms[queryTerms] = qtermsProbDist
+		}
+		/*
+		// debug
+		else
+			print queryTerms + "prob dist found for: " + queryTerms
+		*/
+		
+		return qtermsProbDist
+	}
+	
+	def getSimBasedOnTermRanksOnUserTopics = {
+		// calculate similarity score for the candidate topic
+		topicIdList.each(){ topicTermDistIdx ->   
+		 
+			 /// def simScore = 1
+			 double simScore = 0
+			 // println "topic index: " + topicTermDistIdx
+			 // for this topic aggrerate the score for each term
+			 // in the query
+			 q.split(" ").each() { t ->
+			 	if(t.length()>0) {
+			    	int tIdx = findTermIndex(t)
+			    	// term from the query must be found in the term list
+			    	// println t + " " + tIdx
+			    	if(tIdx < 0) print t + " : in Query: " + q
+			    	assert tIdx >= 0
+			    	/// simScore = simScore * topicTermDist[topicTermDistIdx][tIdx]
+			    	simScore = simScore + topicTermRanks[topicTermDistIdx][tIdx]
+			 	}
+			 }
+			
+			 // use the topic prob for user too in similarity score
+			 simScore = simScore * userTopicProb[uid][topicTermDistIdx] 
+			 
+			// println "topicTermDist-idx: " + topicTermDistIdx + " simscore: " + simScore + " maxscore: " + maxScore
+			if (simScore > maxScore) { 
+				   maxScore = simScore
+				   idx = topicTermDistIdx 
+			}
+		}
+		
+		// println q + " :MS " + maxScore + ", " + idx
+		return idx
+	}
+	
+	def getSimBasedOnEucDistOnUserTopics = {
+			
+		// debug print "terms: " + pQTerms
+		double simScore = 0
+		
+		topicIdList.each() { topicTermDistIdx ->
+		
+			// check score in cache
+			double _score = eucDistQTermsVsTopics[pQTerms][topicTermDistIdx].doubleValue()
+			
+			// debug print " _score: " + _score
+			
+			// found score in the cache
+			if(_score > -1){ 
+				simScore = _score
+				// debug println " found_score: " + _score
+			} 
+			// did not find the score in the cache
+			else {
+			
+				double[] qtermProbDist = getTermProbDistForQueryTerms(pQTerms)
+				// double[] ttermProbDist = MyUtil.ListToDoubleArray(topicTermDist[topicTermDistIdx])
+				double[] ttermProbDist = topicTermDist[topicTermDistIdx]
+				simScore = getEuclideanDistance(qtermProbDist, ttermProbDist)
+				
+				// debug println " simscore from euc: " + simScore
+				
+				// update score cache
+				eucDistQTermsVsTopics[pQTerms][topicTermDistIdx] = simScore
+				
+			}
+			// lower the KL div similar are the topics
+			
+			// bootsrap. simScores are never -ve
+			if(minScore <= -1) minScore = simScore
+			
+			// debug println " minscore: " + minScore
+			
+			if (simScore < minScore) { 
+			   minScore = simScore
+			   idx = topicTermDistIdx 
+			}
+		
+		} // end: for each topic this user serached in
+		
+		return idx
+	}
+	
+	idx = getSimBasedOnEucDistOnUserTopics()
+
+}
+
+/// START SCRIPT EXECUTION
+
+def start = System.currentTimeMillis()
+
+println "loading term topic distribution"
+loadTermTopicDist(fTermTopicDist, termsIdxMap, topicTermDist)
+println "loading topic codes"
+loadTopicCode(fTopicCode, topicCode)
+println "loading user topic list"
+loadUserTopicList(fUserTopicList, userTopicList, userTopicProb)
+
+// {{{ enable this if using topic term ranks in computing similarity 
+// println "building topic term ranks"
+// buildTopicTermRanks(topicTermDist, topicTermRanks)
+// }}}
+
+// checkTermSearch(fUserActivities, termsIdxMap)
+
+
+// loadSessions(fUserActivities, sessions, topicSessionStat, getMostSimTopic, aggStat, 3)
+
+
+/*
+println "Topic Terms Distribution"
+topicTermDist.each(){ t ->
+	t.each() {print it + "\t"}
+	println ""
+}
+println " --------- "
+println "Topic Terms Rank"
+topicTermRanks.each(){ t ->
+	t.each() {print it + "\t"}
+	println ""
+}
+println " --------- "
+*/
+
+// generate sessions with these many intervals
+// def runIntervals = [3, 15, 30, 60, 120, 180, 360]def runIntervals = [ 9999 ]
+
+def aggStatForRuns = [:] // [session_interval : #sessions #search #downloads #started-with-D #started-with-S #ended-with-D #ended-with-S #D-only-ses #s-only-ses ]
+
+
+//== Reports ==
+runIntervals.each() { interval ->
+	println "loading sessions with interval: " + interval + " mins"
+	aggStat = new AggregateSessionStat()	sessions = []	//print sessions.size() + "=\t"+ interval +"=="
+	
+	loadSessions( fUserActivities, sessions, topicSessionStat, 
+			      getMostSimTopic, aggStat, interval, 
+			      topicSearchActCount, topicFollowedCount )
+	
+	println "writing reports for sessions with interval: " + interval + " mins"
+	//	 write out session statistics
+	def fSessionStat = "fsessionStat_" + interval + ".tsv"
+	new File(fData + fSessionStat).withWriter { out ->
+		out.writeLine("Agg. stat")
+		out.writeLine("total sessions: " + aggStat.totalSessions)
+		out.writeLine("search activities: " + aggStat.numOfSearch)
+		out.writeLine("download activities: " + aggStat.numOfDownload)
+		out.writeLine("sessions started with dwnlds: " + aggStat.sessionsStartedWithDwnlds)
+		out.writeLine("sessions started with searches: " + (aggStat.totalSessions - aggStat.sessionsStartedWithDwnlds) )
+		out.writeLine("sessions ended with dwnlds: " + aggStat.sessionsEndedWithDwnlds)
+		out.writeLine("sessions ended with searches: " + (aggStat.totalSessions - aggStat.sessionsEndedWithDwnlds) )
+		out.writeLine("download only sessions: " + aggStat.downloadOnlySessions )
+		out.writeLine("search only sessions: " + aggStat.searchOnlySessions )
+		out.writeLine("")
+		
+		out.writeLine("Topic Session Stat:")
+		out.writeLine("Topic\ts-start\ts-end\td-end\tnum-search-act")
+		(0..topicSessionStat[interval].size()-1).each() { tIdx ->
+			if (topicSessionStat[interval][tIdx] == null) {
+				out.write(topicCode[tIdx] + "\t" + "NA" + "\t" + "NA" + "\t" + "NA")
+				out.write("\t" + topicSearchActCount[tIdx])
+			} else {	
+				out.write(topicCode[tIdx])
+				topicSessionStat[interval][tIdx].each() {out.write("\t" + it)}
+				out.write("\t" + topicSearchActCount[tIdx])
+			}
+			out.writeLine("")
+		}
+				Integer _num = new Integer(interval)		
+		aggStatForRuns[_num] = [    		                            aggStat.totalSessions, 		                            aggStat.numOfSearch, 		                            aggStat.numOfDownload, 
+		                            aggStat.sessionsStartedWithDwnlds, 		                            (aggStat.totalSessions - aggStat.sessionsStartedWithDwnlds),
+		                            aggStat.sessionsEndedWithDwnlds, 		                            (aggStat.totalSessions - aggStat.sessionsEndedWithDwnlds),
+		                            aggStat.downloadOnlySessions, 		                            aggStat.searchOnlySessions		                         ]
+		
+	}
+	
+	//	 write out sessions
+	def fSessions = "fsessions_"+ interval +".tsv"
+	new File(fData + fSessions).withWriter { out ->
+
+		out.writeLine("s_id\ts_d\tquery\tmatched_topic\tuid\tTS")
+		sessions.each() { r ->
+			(0..r.size()-2).each(){ out.write(r[it] + "\t") }
+			if(r[3]==-1) 
+				out.write("NA")
+			else
+				out.write(topicCode[r[3]])	
+					
+			def uTList = userTopicList[r[4]]
+		    out.write("\t(")
+		    uTList.each() { out.write(" " + topicCode[it]) }
+		    out.write(" )")
+		    out.write("\t" + r[4] + "\t" + r[5])
+			out.writeLine("")
+		}
+	}
+}
+
+// write stat for all runs
+new File(fData + "fsessionsRunStat.tsv").withWriter { out ->
+	// header
+	out.writeLine("ses_interval\tsessions\tsearches\tdownloads\tstarted-with-D\tstarted-with-S\tended-with-D\tended-with-S\tD-only-ses\ts-only-ses")
+	aggStatForRuns.each(){ interval, data ->		// print "--"+ interval +"--"
+		out.write(interval + "")
+		data.each(){
+			out.write("\t" + it)
+		}
+		out.writeLine("")
+	}
+}
+
+println "writing tables for topic followed"
+topicFollowedCount.each(){ key,value ->
+	// println "topic followed count for interval: " + key
+	new File(fData + "topicFollowed_" + key + ".tsv").withWriter { out ->
+		for(int i=0; i<51; i++){
+			for(int j=0; j<51; j++){
+				
+				out.write("\t" + value[i][j])
+			}
+			
+			// don't put an empty line as the last row
+			if(i<Constants.NUM_OF_TOPICS) out.writeLine("")
+		}
+	
+	}	
+}
+
+
+def end = System.currentTimeMillis()
+
+println "Done processing.\nTotal " + TimeUtil.printElapsedTime(start, end)
+
+// == End: Reports ==
+
+// debug
+// topicCode.each() { print it + "\t"}
+/*
+userTopicList.each() { u, tl ->
+	print u + " : "
+	tl.each() {print topicCode[it] + "\t"}
+	println ""
+}
+*/
+
+// println("Total sessions: " + sessionStat.size())
+println "\n----\ndone"
+
+
+// == methods ==
+def buildTopicTermRanks(topicTermDist, topicTermRanks) {
+	topicTermDist.each() { topic ->
+		double[] termProb = new double[topic.size()]
+		(0..topic.size()-1).each() { idx ->
+			termProb[idx] = topic[idx].doubleValue()
+		}
+		int[] ranks = Util2.elementRank(termProb, topic.size())
+		topicTermRanks.add(ranks)
+	}
+}
+	
+	
+def loadTermTopicDist(fTTD, termsIdxMap, topicTermDist){
+	def fr = new FileReader(fTTD)
+	// load terms
+	String terms = fr.readLine()
+	int i = 0
+	terms.split("\t").each() {
+		termsIdxMap[it] = i
+		// termsList[i++] = it
+	}
+	// load terms prob dist for each topic
+	i = 0
+	fr.readLines().each(){ pd ->
+		def _prob = []
+		pd.split("\t").each(){ p ->
+			_prob.add(new Double(p).doubleValue())
+		}
+		topicTermDist[i++] = _prob
+	}
+}
+
+
+def loadUserTopicList(fUserTopicList, userTopicList, userTopicProb){
+	def fr = new File(fUserTopicList)
+	// uid n=(#topics + 1) E t1 tp1 ... tn tpn
+	fr.splitEachLine("\t") { cols ->
+		def uid = cols[0]
+		int nTopics = new Integer(cols[1]).intValue()
+			// file has number of topics + 1
+			nTopics = nTopics - 1
+		def tList = []
+		userTopicProb[uid] = []
+		int i = 0
+		(0..nTopics-1).each(){ tidx ->
+			// strip 'N' from 'TopicN'
+			int _t = new Integer(cols[3 + i].replace("Topic","").trim()).intValue()
+			// topic numbering starts from 1 in the file
+			tList[tidx] = _t - 1
+			userTopicProb[uid][_t - 1] = new Double(cols[3 + i + 1]).doubleValue() 
+			i = i + 2
+		}
+		userTopicList[uid] = tList
+		
+	}
+}
+
+
+def loadTopicCode(fTopicCode, topicCode) {
+	def fr = new File(fTopicCode)
+	fr.splitEachLine("\t") { cols ->
+		int tIdx = new Integer(cols[1].replace("Topic","").trim()).intValue()
+		topicCode[tIdx-1] = cols[0]
+	}
+}
+
+
+def loadSessions( fAct, sessions, topicSessionStat, getMostSimTopic, 
+		          aggStat, sessionInterval, topicSearchActCount, 
+		          topicFollowedCount ) {
+	
+	def fr = new File(fAct)
+	int session_id = 0
+	int yesterday = 0
+	int today = 0
+	
+	topicFollowedCount[sessionInterval] = new int[51][51]
+	topicSessionStat[sessionInterval] = []
+	aggStat.sessionsStartedWithDwnlds = 0
+	aggStat.sessionsEndedWithDwnlds = 0
+	boolean pickedFirstSearch = true
+	
+	String now = ""
+	String before = ""
+	
+	// topic session stat updating closures
+	// update topicSessionStat 
+	// [ [#sessions_started_with #sessions_ended_with #dwnlds_ended_with] .. ]
+	
+	def incTopicTermStat = { topicIdx, statIdx ->
+		def _stat = topicSessionStat[sessionInterval][topicIdx]
+		if (_stat == null) {
+			_stat = [0, 0, 0]
+			topicSessionStat[sessionInterval][topicIdx] = _stat
+		}
+		topicSessionStat[sessionInterval][topicIdx][statIdx] = topicSessionStat[sessionInterval][topicIdx][statIdx] + 1
+	}
+	
+	def incStartedWith = { tIdx ->
+		incTopicTermStat(tIdx, 0)
+	}
+	
+	def incEndedWith = { tIdx ->
+		incTopicTermStat(tIdx, 1)
+	}
+	
+	def incDownloadFollowed = { tIdx ->
+		incTopicTermStat(tIdx, 2)
+	}
+	// end: topic session stat updating closures
+	
+	def lastUid = "-1"
+	int lastTopicIdx = -1
+	String previousActivityType = ""
+	int previousSearchSessionId = -1
+	int previousSessionId = -1
+	int numOfSearchesInPreviousSession = 0
+	int numOfDownloadsInPreviousSession = 0
+	String _sOrD = ""
+	
+	// 0        1   2       3   4   5   6   7
+	// Terms	sID	lang	d	m	y	ts	uid
+	fr.splitEachLine("\t") { cols ->
+		// println "no of cols in act: " + cols.size()
+		if(cols.size() == 8){
+			
+			// info extracted per line (activity)
+			
+			// default values for similar topic (also indicates the activity is a download if -1)
+			int _topicIdx = -1
+			// activity type
+			_sOrD = ""
+			// terms from query or file id from download
+			String _trmOrFid = cols[7]
+			// language chosen (for search) or project id (for download)
+			String _langOrProjId = cols[2].trim()
+			// true if download
+			boolean _isDownload = (_langOrProjId ==~ /-{0,1}[0-9]+/)
+			// user id
+			def _uid = cols[0]
+			
+			// get most similar topic if it is a search activity
+			if(!_isDownload) {
+				
+				String _processedQryTerms = _trmOrFid.trim().replaceAll("[^\\w]"," ").replaceAll("_"," ").trim()
+				_processedQryTerms = _processedQryTerms.replaceAll("\\s+"," ")
+				_topicIdx = getMostSimTopic(_uid, _processedQryTerms)
+				_sOrD = "S"
+				
+				// TODO updateSearchCount
+				aggStat.numOfSearch++
+				
+				// only need to get the counts once
+				if (sessionInterval==1){
+					topicSearchActCount[_topicIdx] = topicSearchActCount[_topicIdx] + 1
+				}
+				
+				if(!pickedFirstSearch){
+					incStartedWith(_topicIdx)
+					pickedFirstSearch = true
+				}
+				
+			} else {
+				_sOrD = "D"
+				
+				// TODO updateDownloadCount
+				aggStat.numOfDownload++
+				
+				// only consider downloads after search in the same session
+				if (previousActivityType == 'S' && _uid.equals(lastUid) 
+						&& previousSearchSessionId>0 && (previousSearchSessionId == session_id)) {
+					assert lastTopicIdx >= 0 
+					incDownloadFollowed(lastTopicIdx)
+				}
+			}
+			
+			// bootstrap previous activity type
+			if(previousActivityType.equals("")) previousActivityType = _sOrD
+			
+			// compute session
+			String _ts = cols[6]
+			// for time-based-session, each session can be a day
+			now = _ts
+			
+			// bootstrap before for the first activity
+			if (before.equals("")) before = _ts
+			// bootstrap uid for the first activity
+			if (lastUid == "-1") lastUid = _uid
+			
+			// if you are using a day as a session
+			today = new Integer(_ts.split(" ")[0].replaceAll("-","")).intValue()
+			
+			// if time-based-session changes or user changes, produce a new session
+			
+			boolean breakSession = false
+			
+			if (sessionInterval==1){
+				breakSession = (today > yesterday || _uid.equals(lastUid))
+			} else if (sessionInterval==9999) {
+				breakSession = ! _uid.equals(lastUid)
+			} else {
+				breakSession = ( TimeUtil.minDiff(before, now) >= sessionInterval || ! _uid.equals(lastUid) )
+			}
+			
+			// if (today > yesterday || _uid != lastUid) { // if using a day as a session
+			
+			// 15 mins interval between sessions			// print "== " + sessionInterval + " =="
+			/* if ( TimeUtil.minDiff(before, now) >= sessionInterval || ! _uid.equals(lastUid)) { */
+			if (breakSession) {	
+				
+				// preceeding session ends
+				if (numOfSearchesInPreviousSession > 0 && lastTopicIdx >= 0) { 
+					// updateLastTopic
+					incEndedWith(lastTopicIdx)
+				}
+				
+				if (previousActivityType == "D") {
+					aggStat.sessionsEndedWithDwnlds++
+				}
+				
+				if (numOfSearchesInPreviousSession == 0 && numOfDownloadsInPreviousSession>0){
+					aggStat.downloadOnlySessions++
+				}
+				
+				if (numOfDownloadsInPreviousSession == 0 && numOfSearchesInPreviousSession>0){
+					aggStat.searchOnlySessions++
+				}
+		
+				// new session starts	
+				session_id++
+				numOfSearchesInPreviousSession = 0
+				numOfDownloadsInPreviousSession = 0
+					
+				if (_sOrD == "S") {
+					assert _topicIdx >= 0
+					incStartedWith(_topicIdx)
+					pickedFirstSearch = true
+				} else {
+					assert _sOrD == "D"
+					aggStat.sessionsStartedWithDwnlds++
+					pickedFirstSearch = false
+				}
+			} // if break session
+			
+			lastUid = _uid
+			
+			assert _sOrD != ""
+			if(_sOrD.equals("S"))  { 
+				lastTopicIdx = _topicIdx
+				// println "prev: " + previousSearchSessionId + " curr:" + session_id
+				previousSearchSessionId = session_id
+			}
+			
+			// making current data the previous one
+			yesterday = today	
+            before = now
+           
+			if (_sOrD == "S") 
+				numOfSearchesInPreviousSession++
+			else
+				numOfDownloadsInPreviousSession++
+            
+			// debug
+			// println "sid: " + session_id + " s/d: " + _sOrD + " topic: "+ _topicIdx + " prevAct: " + previousActivityType + " prevSid: " + previousSessionId 
+			sessions.add([session_id, _sOrD, _trmOrFid, _topicIdx, _uid, now])
+			
+			if(previousSessionId == session_id && previousActivityType=="S"){
+				if(_sOrD.equals("D")){
+					// debug
+					// println "download followed search " + lastTopicIdx + " , old value " + topicFollowedCount[sessionInterval][lastTopicIdx][Constants.NUM_OF_TOPICS]
+					topicFollowedCount[sessionInterval][lastTopicIdx][Constants.NUM_OF_TOPICS] = topicFollowedCount[sessionInterval][lastTopicIdx][Constants.NUM_OF_TOPICS] + 1
+					
+					
+				} else {
+					// debug
+					// println "search followed search " + lastTopicIdx + " , old value " + topicFollowedCount[sessionInterval][lastTopicIdx][_topicIdx]
+					topicFollowedCount[sessionInterval][lastTopicIdx][_topicIdx] = topicFollowedCount[sessionInterval][lastTopicIdx][_topicIdx] + 1
+				}
+			}
+			
+			previousActivityType = _sOrD
+			previousSessionId = session_id
+			
+			// update session stat
+			// [ [session_id : [uid, first_topic, last_topic, num_dwnlds, num_search, num_topics]] .. ]
+	
+			} // end if col size 8
+	} // end split each line
+	
+	
+	// the last line
+	if (numOfSearchesInPreviousSession>0 && lastTopicIdx >= 0) incEndedWith(lastTopicIdx)
+	
+	if (numOfSearchesInPreviousSession == 0 && numOfDownloadsInPreviousSession>0){
+		aggStat.downloadOnlySessions++
+	}
+	
+	if (numOfDownloadsInPreviousSession == 0 && numOfSearchesInPreviousSession>0){
+		aggStat.searchOnlySessions++
+	}
+	
+	if (_sOrD == 'D') aggStat.sessionsEndedWithDwnlds++
+	aggStat.totalSessions = session_id + 1
+
+} // end load sessions
+
+
+
+// diagnostic
+
+def checkTermSearch(fAct, termsIdxMap) {
+	
+	def findTermIndex = { term ->
+		// println "found term: " + term
+		def foundIdx = -1 
+		def _r = termsIdxMap[term]
+		if(_r!=null) foundIdx = _r
+		// println "at: " + foundIdx
+		return foundIdx
+	}
+	
+	f = new File(fAct)
+	f.splitEachLine("\t") { cols ->
+		String _trmOrFid = cols[7]
+		
+		String _langOrProjId = cols[2].trim()
+		boolean _isDownload = (_langOrProjId ==~ /-{0,1}[0-9]+/)
+		          
+		if(!_isDownload) {
+			String _processedQryTerms = _trmOrFid.trim().replaceAll("[^\\w]"," ").replaceAll("_"," ").trim()
+			_processedQryTerms = _processedQryTerms.replaceAll("\\s+"," ")
+			
+			_processedQryTerms.split(" ").each() { trm ->
+				
+				println trm + "[" + trm.length() + "]"
+				if (trm.length() > 0) {
+					assert findTermIndex(trm) >= 0
+				}
+				
+			}
+			println ""
+		}
+ }
+}
+
+public class DateElements {
+	
+	public int year, month, date, hour, minute, second
+
+	//	 assuming date is a String in the following
+	// format:
+	//   2007-01-04 08:37:45.000
+	//   yyyy-mm-dd hh:mm:ss.ms
+	public DateElements getUpdatedDateElements(String sDate){
+		setDateElements(sDate)
+		return this
+	}
+	
+	private void setDateElements(String sDate){
+		String[] fChunk = sDate.split(" ")
+		
+		String[] ymd = fChunk[0].split("-")
+		this.year = new Integer(ymd[0]).intValue()
+		this.month = new Integer(ymd[1]).intValue()
+		this.date = new Integer(ymd[2]).intValue()
+		
+		String[] hms = fChunk[1].split(":")
+		this.hour = new Integer(hms[0]).intValue()
+		this.minute = new Integer(hms[1]).intValue()
+		
+		String[] sm = hms[2].split("\\.")
+		this.second = new Integer(sm[0]).intValue()
+	}
+		
+}
+
+
+public class TimeUtil {
+
+    static public int minDiff(String start, String end){
+    	
+    	GregorianCalendar cal = new GregorianCalendar()
+    	DateElements s = new DateElements().getUpdatedDateElements(start)
+    	DateElements e = new DateElements().getUpdatedDateElements(end)
+    	cal.set(s.year, s.month, s.date, s.hour, s.minute, s.second) 
+    	Date sd = cal.getTime()
+    	cal.set(e.year, e.month, e.date, e.hour, e.minute, e.second)
+    	Date ed = cal.getTime()
+    	
+    	long diff = ed.getTime() - sd.getTime()
+    	// return minutes
+    	return diff / (1000 * 60)
+    }
+	
+	static public String printElapsedTime(long start, long stop) {
+		
+	    String elapsed = new String("elapsed time: ");
+	
+	    long hours = calcElapsedHours(start, stop);
+	    long min = calcElapsedMinutes(start, stop) % 60;
+	    long sec = calcElapsedSeconds(start, stop) % 60;
+	    long msec = calcElapsedMillis(start, stop) % 1000;
+	
+	    if(hours < 10)
+	       elapsed = elapsed.concat("0");
+	    elapsed = elapsed.concat(String.valueOf(hours));
+	    elapsed = elapsed.concat(":");
+	
+	    if(min < 10)
+	       elapsed = elapsed.concat("0");
+	    elapsed = elapsed.concat(String.valueOf(min));
+	    elapsed = elapsed.concat(":");
+	
+	    if(sec < 10)
+	       elapsed = elapsed.concat("0");
+	    elapsed = elapsed.concat(String.valueOf(sec));
+	    elapsed = elapsed.concat(".");
+	
+	    if(msec < 10)
+	       elapsed = elapsed.concat("00");
+	    else if(msec < 100)
+	       elapsed = elapsed.concat("0");
+	    elapsed = elapsed.concat(String.valueOf(msec));
+	
+	    return elapsed;
+	}
+	
+	static public long calcElapsedMillis(long start, long stop)
+	{
+	   return stop - start;
+	}
+	
+	static public long calcElapsedSeconds(long start, long stop)
+	{
+	   return calcElapsedMillis(start, stop) / 1000;
+	}
+	
+	static public long calcElapsedMinutes(long start, long stop)
+	{
+	   return calcElapsedSeconds(start, stop) / 60;
+	}
+		
+	static public long calcElapsedHours(long start, long stop) 
+	{
+	   return calcElapsedMinutes(start, stop) / 60;
+	}
+}
+
+class AggregateSessionStat {
+	public int sessionsStartedWithDwnlds = 0
+	public int sessionsEndedWithDwnlds = 0
+	public int totalSessions = 0
+	public int numOfSearch = 0;
+	public int numOfDownload = 0;
+	public int downloadOnlySessions = 0;
+	public int searchOnlySessions = 0;
+}
+
+class OneSessionStat {
+	String startActType = ""
+	String endActType = ""
+	int firstSearchTopic = -1
+	int lastSearchTopic = -1
+	int numOfSearch = 0 
+	int numOfDownload = 0
+	def uid = "-1"
+	String startTimeStamp = ""
+	String endTimeStamp = ""
+}
+
+class MyUtil{
+	
+	public static printDoubleArray(double[] darray){
+		for (int i=0; i<darray.length; i++){
+			print " " + darray[i]
+		}
+		println ""
+	}
+	
+	public static double[] ListToDoubleArray(alist) {
+		
+		double[] darray = new double[alist.size()]
+		
+		for(int i=0; i<darray.length; i++){
+			darray[i] = (Double) alist[i].doubleValue()
+		}
+		
+	return darray
+	
+	}
+	
+	private static double log (int base, double n) {
+		double log_base_e_of_n = Math.log (n);
+		double log_base_e_of_base = Math.log (base);
+		
+		return log_base_e_of_n / log_base_e_of_base;
+	}
+	
+	/** squared euclidean distance **/
+    static public double squaredEuclidean( double[] x, double[] y)
+    {
+        if( x.length != y.length ) throw new RuntimeException("Arguments must have same number of dimensions.");
+
+        double cumssq = 0.0;
+        for(int i=0; i < x.length; i++)
+            cumssq += (x[i] - y[i]) * (x[i] - y[i]);
+
+        return cumssq;
+    }
+
+    /** euclidean distance **/
+    static public double euclidean( double[] x, double[] y)
+    {
+        return Math.sqrt( squaredEuclidean(x,y) );
+    }
+
+
+	
+}
+
+class Constants {
+	public static int NUM_OF_TOPICS = 50 
+}
+
+
