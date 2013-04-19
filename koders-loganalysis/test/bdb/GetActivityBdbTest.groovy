@@ -23,7 +23,6 @@ import com.sleepycat.collections.StoredEntrySet
 import com.sleepycat.collections.StoredMap
 import junit.framework.TestCase
 
-
 /**
  * @author <a href="sbajrach@ics.uci.edu">skb</a> 	
  *
@@ -34,9 +33,6 @@ public class GetActivityBdbTest extends TestCase{
 	 String dbLoc = "./test/data/bdb.activity";
 	 String dbStat = "./test/data/recordsize.properties";
 	 
-	/* (non-Javadoc)
-	 * @see bdb.BdbViews#getSampleActivityMap()
-	 */
 	void testGetSampleActivityMap(){
 		
 		bdbAdapter = BdbAdapter.getInstance(dbLoc);
@@ -66,7 +62,5 @@ public class GetActivityBdbTest extends TestCase{
 		}
 		
 		bdbAdapter.dispose()
-	}
-	
-	
+	}	
 }
